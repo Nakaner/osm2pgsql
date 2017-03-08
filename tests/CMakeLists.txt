@@ -7,6 +7,7 @@ add_library(middle-tests STATIC middle-tests.cpp middle-tests.hpp)
 set(TESTS
   test-expire-tiles.cpp
   test-hstore-match-only.cpp
+  test-intersecting-tiles.cpp
   test-middle-flat.cpp
   test-middle-pgsql.cpp
   test-middle-ram.cpp
@@ -46,6 +47,7 @@ endforeach()
 
 set(TEST_NODB
  test-expire-tiles
+ test-intersecting-tiles
  test-middle-ram
  test-options-database
  test-options-parse

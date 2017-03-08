@@ -153,6 +153,7 @@ set(osm2pgsql_lib_SOURCES
   expire-tiles.cpp
   geometry-processor.cpp
   id-tracker.cpp
+  intersecting_tiles.cpp
   middle-pgsql.cpp
   middle-ram.cpp
   middle.cpp

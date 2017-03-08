@@ -65,6 +65,7 @@ struct xyz {
 };
 
 static std::shared_ptr<reprojection> defproj(reprojection::create_projection(PROJ_SPHERE_MERC));
+static std::shared_ptr<reprojection> latlonproj(reprojection::create_projection(PROJ_LATLONG));
 
 std::ostream &operator<<(std::ostream &out, const xyz &tile) {
   out << tile.z << "/" << tile.x << "/" << tile.y;
@@ -133,7 +134,7 @@ void test_expire_simple_z1() {
 
     // as big a bbox as possible at the origin to dirty all four
     // quadrants of the world.
-    et.from_bbox(-10000, -10000, 10000, 10000);
+    et.from_bbox_lon_lat(-10000, -10000, 10000, 10000);
     et.output_and_destroy<tile_output_set>(set, minzoom);
 
     ASSERT_EQ(set.m_tiles.size(), 4);
@@ -155,7 +156,7 @@ void test_expire_simple_z3() {
 
     // as big a bbox as possible at the origin to dirty all four
     // quadrants of the world.
-    et.from_bbox(-10000, -10000, 10000, 10000);
+    et.from_bbox_lon_lat(-10000, -10000, 10000, 10000);
     et.output_and_destroy<tile_output_set>(set, minzoom);
 
     ASSERT_EQ(set.m_tiles.size(), 4);
@@ -177,7 +178,7 @@ void test_expire_simple_z18() {
 
     // dirty a smaller bbox this time, as at z18 the scale is
     // pretty small.
-    et.from_bbox(-1, -1, 1, 1);
+    et.from_bbox_lon_lat(-1, -1, 1, 1);
     et.output_and_destroy(set, minzoom);
 
     ASSERT_EQ(set.m_tiles.size(), 4);
@@ -203,7 +204,7 @@ void test_expire_simple_z17_18()
 
     // dirty a smaller bbox this time, as at z18 the scale is
     // pretty small.
-    et.from_bbox(-1, -1, 1, 1);
+    et.from_bbox_lon_lat(-1, -1, 1, 1);
     et.output_and_destroy(set, minzoom);
 
     ASSERT_EQ(set.m_tiles.size(), 8);
@@ -236,7 +237,7 @@ void test_expire_simple_z17_18_one_superior_tile()
     expire_tiles et(18, 20000, defproj);
     tile_output_set set(minzoom);
 
-    et.from_bbox(-163, 140, -140, 164);
+    et.from_bbox_lon_lat(-163, 140, -140, 164);
     et.output_and_destroy(set, minzoom);
 
     ASSERT_EQ(set.m_tiles.size(), 5);
@@ -253,21 +254,107 @@ void test_expire_simple_z17_18_one_superior_tile()
     ++itr;
 }
 
-std::set<xyz> generate_random(uint32_t zoom, size_t count)
+/**
+ * Test expire_from_wkb_polygon() method with a polygon with six corners, three
+ * are rectangular.
+ *
+ * The EWKB string was created by running following PostGIS query:
+ * ```sql
+ * SELECT ST_GeomFromText('POLYGON ((13.4989 52.3512, 13.5727 52.3512, 13.5727
+ * 52.3836, 13.4989 52.3836, 13.49666 52.36135, 13.48731 52.35558, 13.4989 52.3512))', 4326);
+ * ```
+ */
+void test_expire_from_wkb_polygon_no_inner()
 {
-    size_t num = 0;
-    std::set<xyz> set;
-    const int coord_mask = (1 << zoom) - 1;
+    uint32_t minzoom = 12;
+    // OSM way #8048087
+    std::string wkb = "0103000020110F0000010000001100000057A95F38907B2C41F0E8C3BAC4F757416FFB127BCD7C2C41C5C89D9690F7574169A4E922A97D2C41D60AE4206CF757417DAF8A811B7E2C4194FD742F5AF757411E040521637E2C41740DE18952F757410090DFBA157F2C4163A2768D46F7574190CCAAF1937F2C411EB84E9D43F75741C0568F1B03802C411CFC024842F757413D245E2F44802C41CE32C1AE41F75741393BFAB143802C419D7AC7A944F7574143597ADA5C802C415E993D7847F7574106C6AFB484802C418B9A952B48F757418A8E4FA624812C410A5C6C22D2F75741B7A1C90DBC802C41A614557AE0F75741FCD0140D7A7F2C418BD7FF0213F85741E979BB80EF7E2C41B56C66EF24F8574157A95F38907B2C41F0E8C3BAC4F75741";
+    expire_tiles et(12, 0.1, latlonproj);
+    et.from_wkb(wkb.c_str(), 1);
+    tile_output_set set(minzoom);
+    et.output_and_destroy(set, minzoom);
 
-    while (num < count) {
-        xyz item(zoom, rand() & coord_mask, rand() & coord_mask);
-        if (set.count(item) == 0) {
-            set.insert(item);
-            ++num;
-        }
+    ASSERT_EQ(set.m_tiles.size(), 8);
+    std::set<xyz>::iterator itr = set.m_tiles.begin();
+    ASSERT_EQ(*itr, xyz(12, 685, 1460));
+    ++itr;
+    ASSERT_EQ(*itr, xyz(12, 685, 1461));
+    ++itr;
+    ASSERT_EQ(*itr, xyz(12, 685, 1462));
+    ++itr;
+    ASSERT_EQ(*itr, xyz(12, 685, 1463));
+    ++itr;
+    ASSERT_EQ(*itr, xyz(12, 686, 1460));
+    ++itr;
+    ASSERT_EQ(*itr, xyz(12, 686, 1461));
+    ++itr;
+    ASSERT_EQ(*itr, xyz(12, 686, 1462));
+    ++itr;
+    ASSERT_EQ(*itr, xyz(12, 686, 1463));
+}
+
+/**
+ * Test expire_from_wkb_polygon() method with a polygon with one outer ring
+ * like in test_expire_from_wkb_polygon_no_inner() but also one inner ring
+ * with four corners.
+ *
+ * The EWKB string was created by running following PostGIS query:
+ * ```sql
+ * SELECT ST_GeomFromText('POLYGON ((13.4989 52.3512, 13.5727 52.3512, 13.5727
+ * 52.3836, 13.4989 52.3836, 13.49666 52.36135, 13.48731 52.35558, 13.4989
+ * 52.3512), (13.5053 52.3563, 13.5053 52.3811, 13.5679 52.3811, 13.5679
+ * 52.3563, 13.5053 52.3563))', 4326);
+ * ```
+ */
+void test_expire_from_wkb_polygon_with_inner()
+{
+    uint32_t minzoom = 14;
+    std::string wkb = "0103000020E61000000200000007000000E5F21FD26FFF2A40772D211FF42C4A40A1D634EF38252B40772D211FF42C4A40A1D634EF38252B40705F07CE19314A40E5F21FD26FFF2A40705F07CE19314A40757632384AFE2A406E3480B7402E4A400C0742B280F92A404C8E3BA5832D4A40E5F21FD26FFF2A40772D211FF42C4A40050000006D567DAEB6022B404BC8073D9B2D4A406D567DAEB6022B40B84082E2C7304A40FBCBEEC9C3222B40B84082E2C7304A40FBCBEEC9C3222B404BC8073D9B2D4A406D567DAEB6022B404BC8073D9B2D4A40";
+    expire_tiles et(14, 0.1, latlonproj);
+    et.from_wkb(wkb.c_str(), 1);
+    tile_output_set set(minzoom);
+    et.output_and_destroy(set, minzoom);
+
+    ASSERT_EQ(set.m_tiles.size(), 13);
+    std::set<xyz>::iterator itr = set.m_tiles.begin();
+    ASSERT_EQ(*itr, xyz(14, 8805, 5385));
+    ++itr;
+    ASSERT_EQ(*itr, xyz(14, 8806, 5383));
+    ++itr;
+    ASSERT_EQ(*itr, xyz(14, 8806, 5384));
+    ++itr;
+    ASSERT_EQ(*itr, xyz(14, 8806, 5385));
+    ++itr;
+    ASSERT_EQ(*itr, xyz(14, 8807, 5383));
+    ++itr;
+    ASSERT_EQ(*itr, xyz(14, 8807, 5385));
+    ++itr;
+    ASSERT_EQ(*itr, xyz(14, 8808, 5383));
+    ++itr;
+    ASSERT_EQ(*itr, xyz(14, 8808, 5385));
+    ++itr;
+    ASSERT_EQ(*itr, xyz(14, 8809, 5383));
+    ++itr;
+    ASSERT_EQ(*itr, xyz(14, 8809, 5384));
+    ++itr;
+    ASSERT_EQ(*itr, xyz(14, 8809, 5385));
+}
+
+
+
+std::set<xyz> generate_random(int zoom, size_t count) {
+  size_t num = 0;
+  std::set<xyz> set;
+  const int coord_mask = (1 << zoom) - 1;
+
+  while (num < count) {
+    xyz item(zoom, rand() & coord_mask, rand() & coord_mask);
+    if (set.count(item) == 0) {
+      set.insert(item);
+      ++num;
     }
-
-    return set;
+  }
+  return set;
 }
 
 void assert_tilesets_equal(const std::set<xyz> &a,
@@ -453,6 +540,8 @@ int main(int argc, char *argv[])
     RUN_TEST(test_expire_simple_z18);
     RUN_TEST(test_expire_simple_z17_18);
     RUN_TEST(test_expire_simple_z17_18_one_superior_tile);
+    RUN_TEST(test_expire_from_wkb_polygon_no_inner);
+    RUN_TEST(test_expire_from_wkb_polygon_with_inner);
     RUN_TEST(test_expire_set);
     RUN_TEST(test_expire_merge);
     RUN_TEST(test_expire_merge_same);

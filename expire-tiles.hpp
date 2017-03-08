@@ -4,6 +4,7 @@
 #include <memory>
 #include <unordered_set>
 
+#include "intersecting_tiles.hpp"
 #include "osmtypes.hpp"
 
 class reprojection;
@@ -51,7 +52,69 @@ struct expire_tiles
     expire_tiles(uint32_t maxzoom, double maxbbox,
                  const std::shared_ptr<reprojection> &projection);
 
-    int from_bbox(double min_lon, double min_lat, double max_lon, double max_lat);
+    /**
+     * Expire the tile including a small buffer around it where a point is located.
+     *
+     * \param lon longitude of the point
+     * \param lat latitude of the point
+     */
+    void from_point(double lon, double lat);
+
+    /**
+     * Expire tiles intersecting this bounding box.
+     *
+     * This method is similar to from_bbox(double, double, double, double) but
+     * accepts coordinates in the coordinate system of your database,
+     * transforms them to tile IDs and then calls
+     * from_bbox(double, double, double, double). Please note that the
+     * direction of the y axis is different between most projections and tile
+     * IDs.
+     *
+     * \param min_lon x coordinate of lower left corner
+     * \param min_lat y coordinate of lower left corner
+     * \param max_lon x coordinate of upper right corner
+     * \param max_lat y coordinate of upper right corner
+     */
+    void from_bbox_lon_lat(double min_x, double min_y, double max_x, double max_y);
+
+    /**
+     * Expire the tile intersecting this bounding box.
+     *
+     * \param min_lon x coordinate of upper left corner in tile IDs
+     * \param min_lat y coordinate of upper left corner in tile IDs
+     * \param max_lon x coordinate of lower right corner in tile IDs
+     * \param max_lat y coordinate of lower right corner in tile IDs
+     */
+    void from_bbox(double min_x, double min_y, double max_x, double max_y);
+
+    /**
+     * Expire all tiles a line segment intersects with including a small buffer.
+     *
+     * Coordinates (x and y) are in tile IDs (but double).
+     * The start point must have a smaller or equal x index than the end point.
+     *
+     * \param x1 x index of the west end of the segment
+     * \param y1 y index of the west end of the segment
+     * \param x2 x index of the east end of the segment
+     * \param y2 y index of the east end of the segment
+     */
+    void expire_line_segment(double x1, double y1, double x2, double y2);
+
+    /**
+     * Expire a line segment which runs straight from south to north or runs
+     * nearly in that direction.
+     *
+     * Coordinates (x and y) are in tile IDs (but double).
+     * The start point must have a smaller y index than the end point.
+     *
+     * \param x x index of start and end point
+     * \param y1 y index of the start point
+     * \param y2 y index of the end point
+     * \param expire_parallels expire also the buffer of this line segment.
+     */
+    void expire_vertical_line(double x, double y1, double y2,
+                              bool expire_parallels = true);
+
     void from_wkb(const char* wkb, osmid_t osm_id);
     int from_db(table_t* table, osmid_t osm_id);
 
@@ -140,6 +203,21 @@ struct expire_tiles
 
 private:
     /**
+     *  How many tiles worth of space to leave either side of a changed feature
+     **/
+    static constexpr double TILE_EXPIRY_LEEWAY = 0.1;
+
+    /**
+     * Normalise the coordinate (x or y) of a tile at maxzoom zoom level.
+     *
+     * This method checks if the coordinate is within the bounds for tile IDs
+     * at this zoom level and sets it to the bounds if it is too large.
+     *
+     * \returns normalised coordinates
+     */
+    uint32_t normalise_tile_coord(uint32_t coord);
+
+    /**
      * Expire a single tile.
      *
      * \param x x index of the tile to be expired.
@@ -147,11 +225,26 @@ private:
      */
     void expire_tile(uint32_t x, uint32_t y);
     int normalise_tile_x_coord(int x);
-    void from_line(double lon_a, double lat_a, double lon_b, double lat_b);
+    void from_line_lon_lat(double lon_a, double lat_a, double lon_b,
+                           double lat_b);
 
     void from_wkb_point(ewkb::parser_t *wkb);
     void from_wkb_line(ewkb::parser_t *wkb);
     void from_wkb_polygon(ewkb::parser_t *wkb, osmid_t osm_id);
+
+    /**
+     * Evaluate a segment of the outer ring of a polygon.
+     *
+     * Mark all tiles as expired which are inside the bounding box of this polygon.
+     * If there are already tiles with the same x index which are expired,
+     * all tiles between them and the tiles of the bounding box of this segment will be
+     * expired, too.
+     *
+     * All parameters should be the coordinates of the output SRS. This method
+     * will transform them to tile IDs.
+     */
+    void evaluate_segment(intersecting_tiles_t &tiles, double x1, double y1,
+                          double x2, double y2);
 
     double tile_width;
     double max_bbox;

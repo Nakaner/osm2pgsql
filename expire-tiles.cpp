@@ -14,6 +14,8 @@
 #include <cerrno>
 #include <string>
 
+#include <osmium/geom/tile.hpp>
+
 #include "expire-tiles.hpp"
 #include "options.hpp"
 #include "reprojection.hpp"
@@ -22,7 +24,6 @@
 
 #define EARTH_CIRCUMFERENCE		40075016.68
 #define HALF_EARTH_CIRCUMFERENCE	(EARTH_CIRCUMFERENCE / 2)
-#define TILE_EXPIRY_LEEWAY		0.1		/* How many tiles worth of space to leave either side of a changed feature */
 
 tile_output_t::tile_output_t(const char *filename)
 : outfile(fopen(filename, "a"))
@@ -98,12 +99,23 @@ xy_coord_t expire_tiles::quadkey_to_xy(uint64_t quadkey_coord, uint32_t zoom)
     return result;
 }
 
+uint32_t expire_tiles::normalise_tile_coord(uint32_t coord)
+{
+    if (coord < 0) {
+        return 0;
+    } else if (coord > static_cast<uint32_t>((2 << maxzoom) - 1)) {
+        return (2 << maxzoom) - 1;
+    }
+    return coord;
+}
+
 void expire_tiles::expire_tile(uint32_t x, uint32_t y)
 {
     // Only try to insert to tile into the set if the last inserted tile
     // is different from this tile.
     if (last_tile_x != x || last_tile_y != y) {
-        m_dirty_tiles.insert(xy_to_quadkey(x, y, maxzoom));
+        m_dirty_tiles.insert(xy_to_quadkey(normalise_tile_coord(x),
+                                           normalise_tile_coord(y), maxzoom));
         last_tile_x = x;
         last_tile_y = y;
     }
@@ -115,141 +127,176 @@ int expire_tiles::normalise_tile_x_coord(int x) {
 	return x;
 }
 
-/*
- * Expire tiles that a line crosses
- */
-void expire_tiles::from_line(double lon_a, double lat_a, double lon_b, double lat_b) {
-	double	tile_x_a;
-	double	tile_y_a;
-	double	tile_x_b;
-	double	tile_y_b;
-	double	temp;
-	double	x1;
-	double	y1;
-	double	x2;
-	double	y2;
-	double	hyp_len;
-	double	x_len;
-	double	y_len;
-	double	x_step;
-	double	y_step;
-	double	step;
-	double	next_step;
-	int	x;
-	int	y;
-	int	norm_x;
+void expire_tiles::expire_line_segment(double x1, double y1, double x2,
+                                       double y2)
+{
+    //TODO respect buffer by using two parallel lines
+    //TODO respect buffer at start and end
+    assert(x1 <= x2);
+    assert(x2 - x1 <= map_width / 2);
+    if (x1 == x2 && y1 == y2) {
+        // The line is degenerated and only a point.
+        return;
+    }
+    // The following if block ensures that x2-x1 does not cause an
+    // underflow which could cause a division by zero.
+    if (x2 - x1 < 1) {
+        // the extend of the bounding box of the line in x-direction is small
+        if ((static_cast<int>(x2) == static_cast<int>(x1)) ||
+            (x2 - x1 < 0.00000001)) {
+            /**
+             * Case 1: The linestring is parallel to a meridian or does not cross a tile border.
+             * Therefore we can treat it as a vertical linestring.
+             *
+             * Case 2: This linestring is almost parallel (very small error). We just treat it as a parallel of a meridian.
+             * The resulting error is negligible.
+             */
+            if (y2 < y1) {
+                // swap coordinates
+                double temp = y2;
+                y2 = y1;
+                y1 = temp;
+            }
+            expire_vertical_line(x1, y1, y2);
+            return;
+        }
+    }
+    // y(x) = m * x + c with incline as m and y_intercept as c
+    double incline = (y2 - y1) / (x2 - x1);
+    double y_intercept = y2 - incline * x2;
 
-    projection->coords_to_tile(&tile_x_a, &tile_y_a, lon_a, lat_a, map_width);
-    projection->coords_to_tile(&tile_x_b, &tile_y_b, lon_b, lat_b, map_width);
+    // mark start tile as expired
+    from_bbox(x1, y1, x1, y1);
+    // expire all tiles the line enters by crossing their western edge
+    for (int x = static_cast<int>(x1 + 1); x <= static_cast<int>(x2) - 1; x++) {
+        double y = incline * x + y_intercept;
+        expire_tile(x, static_cast<int>(y));
+        // If y is only 0.1 tiles away from a tile edged, we have to expire the neighboring
+        // tile, too. Calling from_bbox(...) would call expire_tile(...) more often than
+        // necessary. (We don't have to expire the tile on the left side of this edge
+        // again.
+        if (static_cast<int>(y - TILE_EXPIRY_LEEWAY) != static_cast<int>(y)) {
+            expire_tile(x, static_cast<int>(y - TILE_EXPIRY_LEEWAY));
+        } else if (static_cast<int>(y + TILE_EXPIRY_LEEWAY) !=
+                   static_cast<int>(y) + 1) {
+            expire_tile(x, static_cast<int>(y + TILE_EXPIRY_LEEWAY));
+        }
+    }
+    // the same for all tiles which are entered by crossing their southern edge
+    expire_tile(static_cast<int>(x1), static_cast<int>(y1));
+    for (int y = static_cast<int>(y1 + 1); y <= static_cast<int>(y2) - 1; y++) {
+        double x = (y - y_intercept) / incline;
+        expire_tile(static_cast<int>(x), y);
+        //TODO explain following ifs
+        if (static_cast<int>(x - TILE_EXPIRY_LEEWAY) != static_cast<int>(x)) {
+            expire_tile(static_cast<int>(x - TILE_EXPIRY_LEEWAY), y);
+        } else if (static_cast<int>(x + TILE_EXPIRY_LEEWAY) !=
+                   static_cast<int>(x) + 1) {
+            expire_tile(static_cast<int>(x + TILE_EXPIRY_LEEWAY), y);
+        }
+    }
+    // expire end node
+    from_bbox(x2, y2, x2, y2);
+}
 
-	if (tile_x_a > tile_x_b) {
-		/* We always want the line to go from left to right - swap the ends if it doesn't */
-		temp = tile_x_b;
-		tile_x_b = tile_x_a;
-		tile_x_a = temp;
-		temp = tile_y_b;
-		tile_y_b = tile_y_a;
-		tile_y_a = temp;
-	}
-
-	x_len = tile_x_b - tile_x_a;
-	if (x_len > map_width / 2) {
-		/* If the line is wider than half the map, assume it
-           crosses the international date line.
-           These coordinates get normalised again later */
-		tile_x_a += map_width;
-		temp = tile_x_b;
-		tile_x_b = tile_x_a;
-		tile_x_a = temp;
-		temp = tile_y_b;
-		tile_y_b = tile_y_a;
-		tile_y_a = temp;
-	}
-	y_len = tile_y_b - tile_y_a;
-	hyp_len = sqrt(pow(x_len, 2) + pow(y_len, 2));	/* Pythagoras */
-	x_step = x_len / hyp_len;
-	y_step = y_len / hyp_len;
-
-	for (step = 0; step <= hyp_len; step+= 0.4) {
-		/* Interpolate points 1 tile width apart */
-		next_step = step + 0.4;
-		if (next_step > hyp_len) next_step = hyp_len;
-		x1 = tile_x_a + ((double)step * x_step);
-		y1 = tile_y_a + ((double)step * y_step);
-		x2 = tile_x_a + ((double)next_step * x_step);
-		y2 = tile_y_a + ((double)next_step * y_step);
-
-		/* The line (x1,y1),(x2,y2) is up to 1 tile width long
-           x1 will always be <= x2
-           We could be smart and figure out the exact tiles intersected,
-           but for simplicity, treat the coordinates as a bounding box
-           and expire everything within that box. */
-		if (y1 > y2) {
-			temp = y2;
-			y2 = y1;
-			y1 = temp;
-		}
-		for (x = x1 - TILE_EXPIRY_LEEWAY; x <= x2 + TILE_EXPIRY_LEEWAY; x ++) {
-			norm_x =  normalise_tile_x_coord(x);
-			for (y = y1 - TILE_EXPIRY_LEEWAY; y <= y2 + TILE_EXPIRY_LEEWAY; y ++) {
-				expire_tile(norm_x, y);
-			}
-		}
-	}
+void expire_tiles::expire_vertical_line(double x, double y1, double y2,
+                                        bool expire_parallels /* = true*/)
+{
+    assert(y1 <= y2); // line in correct order and not collapsed
+    // mark the tile of the southern end and its buffer as expired
+    from_bbox(static_cast<int>(x), static_cast<int>(y1), static_cast<int>(x),
+              static_cast<int>(y1));
+    // mark all tiles above it as expired until we reach the northern end of the line
+    for (int y = static_cast<int>(y1 + 1); y < static_cast<int>(y2); y++) {
+        expire_tile(static_cast<int>(x), y);
+    }
+    // mark the tile at the northern end and its buffer as expired
+    from_bbox(static_cast<int>(x), static_cast<int>(y2), static_cast<int>(x),
+              static_cast<int>(y2));
+    // expire parallels of this line with a distance of TILE_EXPIRY_LEEWAY
+    // If it is not necessary because the parallels run through the same tiles,
+    // we don't call this method again.
+    if (expire_parallels &&
+        static_cast<int>(x - TILE_EXPIRY_LEEWAY) == static_cast<int>(x)) {
+        expire_vertical_line(x - TILE_EXPIRY_LEEWAY, y1, y2, false);
+    } else if (expire_parallels &&
+               static_cast<int>(x + TILE_EXPIRY_LEEWAY) ==
+                   static_cast<int>(x) + 1) {
+        expire_vertical_line(x + TILE_EXPIRY_LEEWAY, y1, y2, false);
+    }
 }
 
 /*
- * Expire tiles within a bounding box
+ * Expire tiles that a line crosses
  */
-int expire_tiles::from_bbox(double min_lon, double min_lat, double max_lon, double max_lat) {
-	double		width;
-	double		height;
-	int		min_tile_x;
-	int		min_tile_y;
-	int		max_tile_x;
-	int		max_tile_y;
-	int		iterator_x;
-	int		iterator_y;
-	int		norm_x;
-	int		ret;
-    double  tmp_x;
-    double  tmp_y;
-
-	if (maxzoom == 0) return 0;
-
-	width = max_lon - min_lon;
-	height = max_lat - min_lat;
-	if (width > HALF_EARTH_CIRCUMFERENCE + 1) {
-		/* Over half the planet's width within the bounding box - assume the
-           box crosses the international date line and split it into two boxes */
-		ret = from_bbox(-HALF_EARTH_CIRCUMFERENCE, min_lat, min_lon, max_lat);
-		ret += from_bbox(max_lon, min_lat, HALF_EARTH_CIRCUMFERENCE, max_lat);
-		return ret;
-	}
-
-    if (width > max_bbox || height > max_bbox) {
-        return -1;
+void expire_tiles::from_line_lon_lat(double lon_a, double lat_a, double lon_b,
+                                     double lat_b)
+{
+    double tile_x_a;
+    double tile_y_a;
+    double tile_x_b;
+    double tile_y_b;
+    projection->coords_to_tile(&tile_x_a, &tile_y_a, lon_a, lat_a, map_width);
+    projection->coords_to_tile(&tile_x_b, &tile_y_b, lon_b, lat_b, map_width);
+    // swap ends of this segment if necessary because we go from left to right
+    if (tile_x_a > tile_x_b) {
+        std::swap(tile_x_a, tile_x_b);
+        std::swap(tile_y_a, tile_y_b);
     }
+    if (tile_x_b - tile_x_a > map_width / 2) {
+        // line crosses 180th meridian → split the line at its intersection with this meridian
+        // x-coordinate of intersection point: map_width/2
+        double y_split; // y-coordinate of intersection point
+        if (tile_x_b == map_width && tile_x_a == 0) {
+            // The line is part of the 180th meridian. We have to treat this in a special way, otherwise there will
+            // be a division by 0 in the following code.
+            expire_line_segment(0, tile_y_a, 0, tile_y_b);
+            return;
+        }
+        // This line runs from western to eastern hemisphere over the 180th meridian
+        // use intercept theorem to get the intersection point of the line and the 180th meridian
+        // x-distance between left point and 180th meridian
+        double x_distance = map_width + tile_x_a - tile_x_b;
+        // apply intercept theorem: (y2-y1)/(y_split-y1) = (x2-x1)/(x_split-x1)
+        y_split = tile_y_a + (tile_y_b - tile_y_a) * (tile_x_a / x_distance);
+        expire_line_segment(0, y_split, tile_x_a, tile_y_a);
+        expire_line_segment(tile_x_b, tile_y_b, map_width, y_split);
+    } else {
+        expire_line_segment(tile_x_a, tile_y_a, tile_x_b, tile_y_b);
+    }
+}
 
+void expire_tiles::from_point(double lon, double lat)
+{
+    double tile_x;
+    double tile_y;
+    projection->coords_to_tile(&tile_x, &tile_y, lon, lat, map_width);
+    from_bbox(tile_x, tile_y, tile_x, tile_y);
+}
 
-	/* Convert the box's Mercator coordinates into tile coordinates */
-        projection->coords_to_tile(&tmp_x, &tmp_y, min_lon, max_lat, map_width);
-        min_tile_x = tmp_x - TILE_EXPIRY_LEEWAY;
-        min_tile_y = tmp_y - TILE_EXPIRY_LEEWAY;
-        projection->coords_to_tile(&tmp_x, &tmp_y, max_lon, min_lat, map_width);
-        max_tile_x = tmp_x + TILE_EXPIRY_LEEWAY;
-        max_tile_y = tmp_y + TILE_EXPIRY_LEEWAY;
-	if (min_tile_x < 0) min_tile_x = 0;
-	if (min_tile_y < 0) min_tile_y = 0;
-	if (max_tile_x > map_width) max_tile_x = map_width;
-	if (max_tile_y > map_width) max_tile_y = map_width;
-	for (iterator_x = min_tile_x; iterator_x <= max_tile_x; iterator_x ++) {
-		norm_x =  normalise_tile_x_coord(iterator_x);
-		for (iterator_y = min_tile_y; iterator_y <= max_tile_y; iterator_y ++) {
-			expire_tile(norm_x, iterator_y);
-		}
-	}
-	return 0;
+void expire_tiles::from_bbox_lon_lat(double min_x, double min_y, double max_x,
+                                     double max_y) {
+    double x_min;
+    double y_min;
+    double x_max;
+    double y_max;
+    projection->coords_to_tile(&x_min, &y_max, min_x, min_y, map_width);
+    projection->coords_to_tile(&x_max, &y_min, max_x, max_y, map_width);
+    from_bbox(x_min, y_min, x_max, y_max);
+}
+
+void expire_tiles::from_bbox(double min_x, double min_y, double max_x,
+                             double max_y)
+{
+    min_x -= TILE_EXPIRY_LEEWAY;
+    min_y -= TILE_EXPIRY_LEEWAY;
+    max_x += TILE_EXPIRY_LEEWAY;
+    max_y += TILE_EXPIRY_LEEWAY;
+    for (int iterator_x = min_x; iterator_x <= max_x; iterator_x++) {
+        for (int iterator_y = min_y; iterator_y <= max_y; iterator_y++) {
+            expire_tile(iterator_x, iterator_y);
+        }
+    }
 }
 
 
@@ -261,7 +308,8 @@ void expire_tiles::from_wkb(const char *wkb, osmid_t osm_id)
 
     auto parse = ewkb::parser_t(wkb);
 
-    switch (parse.read_header()) {
+    int header = parse.read_header();
+    switch (header) {
     case ewkb::wkb_point:
         from_wkb_point(&parse);
         break;
@@ -289,15 +337,15 @@ void expire_tiles::from_wkb(const char *wkb, osmid_t osm_id)
     }
     default:
         fprintf(stderr, "OSM id %" PRIdOSMID
-                        ": Unknown geometry type, cannot expire.\n",
-                osm_id);
+                        ": Unknown geometry type %d, cannot expire.\n",
+                osm_id, header);
     }
 }
 
 void expire_tiles::from_wkb_point(ewkb::parser_t *wkb)
 {
     auto c = wkb->read_point();
-    from_bbox(c.x, c.y, c.x, c.y);
+    from_point(c.x, c.y);
 }
 
 void expire_tiles::from_wkb_line(ewkb::parser_t *wkb)
@@ -314,7 +362,7 @@ void expire_tiles::from_wkb_line(ewkb::parser_t *wkb)
         auto prev = wkb->read_point();
         for (size_t i = 1; i < sz; ++i) {
             auto cur = wkb->read_point();
-            from_line(prev.x, prev.y, cur.x, cur.y);
+            from_line_lon_lat(prev.x, prev.y, cur.x, cur.y);
             prev = cur;
         }
     }
@@ -332,6 +380,7 @@ void expire_tiles::from_wkb_polygon(ewkb::parser_t *wkb, osmid_t osm_id)
 
     osmium::geom::Coordinates min{initpt}, max{initpt};
 
+    // get bounding box of the polygon
     for (size_t i = 1; i < num_pt; ++i) {
         auto c = wkb->read_point();
         if (c.x < min.x)
@@ -343,24 +392,85 @@ void expire_tiles::from_wkb_polygon(ewkb::parser_t *wkb, osmid_t osm_id)
         if (c.y > max.y)
             max.y = c.y;
     }
-
-    if (from_bbox(min.x, min.y, max.x, max.y)) {
-        /* Bounding box too big - just expire tiles on the line */
-        fprintf(stderr,
-                "\rLarge polygon (%.0f x %.0f metres, OSM ID %" PRIdOSMID
-                ") - only expiring perimeter\n",
-                max.x - min.x, max.y - min.y, osm_id);
-        wkb->rewind(start);
+    wkb->rewind(start);
+    /* Bounding boxes wider than half of the circumfence of the earth are
+       treated as evil polygons because
+       (1) they currently do not exist in OSM due to (2),
+       (2) most software does not handle them correctly,
+       (3) it is not unsafe if they are not expired.
+       We had to split them at the antimeridian if we want to handle them
+       properly. */
+    if (max.x - min.x > max_bbox || max.y - min.y > max_bbox) {
+        // expire all rings as if they were only lines
         for (unsigned ring = 0; ring < num_rings; ++ring) {
+            wkb->rewind(start);
             from_wkb_line(wkb);
-        }
-    } else {
-        // ignore inner rings
-        for (unsigned ring = 1; ring < num_rings; ++ring) {
-            auto inum_pt = wkb->read_length();
-            wkb->skip_points(inum_pt);
+            return;
         }
     }
+    // reproject coordinates of bounding box
+    double min_x;
+    double min_y;
+    double max_x;
+    double max_y;
+    // min and max are swapped when calling projection->coords_to_tile()
+    // because
+    projection->coords_to_tile(&min_x, &min_y, min.x, max.y, map_width);
+    projection->coords_to_tile(&max_x, &max_y, max.x, min.y, map_width);
+
+    // If the polygon does not the border between two tile columns in maxzoom,
+    // it can be simply expired by expiring its bounding box.
+    if (static_cast<uint32_t>(min_x) == static_cast<uint32_t>(max_x)) {
+        from_bbox(min_x, min_y, max_x, max_y);
+    }
+
+    wkb->rewind(start);
+    // expire interior of outer ring and a few tiles more
+    // arguments swapped because of different direction of x and y axis
+    intersecting_tiles_t tiles(min_x, max_x, map_width, TILE_EXPIRY_LEEWAY);
+    for (unsigned ring = 0; ring < num_rings; ++ring) {
+        auto ring_size = wkb->read_length();
+        if (ring_size <= 1 && ring == 0) {
+            // outer ring degenerated, ignore the whole polygon
+            return;
+        } else if (ring_size <= 3) {
+            /* degenerated inner rings don't reduce the number of expired tiles
+             * We don't have to care for them. */
+            continue;
+        } else {
+            auto prev = wkb->read_point();
+            for (size_t i = 1; i < ring_size; ++i) {
+                auto cur = wkb->read_point();
+                // reproject the coordinates
+                double tile_x_a;
+                double tile_y_a;
+                double tile_x_b;
+                double tile_y_b;
+                projection->coords_to_tile(&tile_x_a, &tile_y_a, prev.x, prev.y,
+                                           map_width);
+                projection->coords_to_tile(&tile_x_b, &tile_y_b, cur.x, cur.y,
+                                           map_width);
+                // ring == 0 is an outer ring, all other rings are inner rings
+                tiles.evaluate_segment(tile_x_a, tile_y_a, tile_x_b, tile_y_b,
+                                       (ring == 0));
+                prev = cur;
+            }
+        }
+    }
+    // mark tiles as expired
+    do {
+        while (tiles.column_has_intervals()) {
+            std::unique_ptr<std::pair<uint32_t, uint32_t>> interval =
+                tiles.get_next_pair();
+            //TODO handling if interval is nullptr
+            if (!interval) {
+                continue;
+            }
+            //TODO handling last column
+            from_bbox(tiles.get_current_x(), interval->first,
+                      tiles.get_current_x(), interval->second);
+        }
+    } while (tiles.move_to_next_column());
 }
 
 /*

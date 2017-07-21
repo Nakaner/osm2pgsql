@@ -18,14 +18,14 @@ using stripe_t = std::vector<crossings_t>;
 /**
  * This class stores the information which tiles are inside a polygon.
  *
- * The heart of this class are two vectors. Each element of these vectors
+ * The heart of this class are two vectors. Each element of these two vectors
  * represents one column in the tile grid (i.e. stripes from south to north).
  * The vectors themselves contain vectors with doubles.
  *
  * We check for each segment whether the interior of the polygon is above the
  * segment or below. If the interior is above, we add the maximum y value of
  * the bounding box of this segment to the maximums vector. If the interior of
- * the polygon is below the this segment, we add the minimum y value of the
+ * the polygon is below this segment, we add the minimum y value of the
  * bounding box of this segment to the minimums vector. That's the way it works
  * in short. For all edge cases see the comments in the source file.
  *

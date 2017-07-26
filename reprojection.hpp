@@ -40,8 +40,8 @@ public:
      * The zoom level for the coordinates is explicitly given in the
      * variable map_width.
      */
-    void coords_to_tile(double *tilex, double *tiley,
-                        double lon, double lat, int map_width);
+    void coords_to_tile(double *tilex, double *tiley, double lon, double lat,
+                        uint32_t map_width);
     virtual int target_srs() const = 0;
     virtual const char *target_desc() const = 0;
 

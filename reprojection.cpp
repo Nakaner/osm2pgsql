@@ -128,9 +128,8 @@ reprojection *reprojection::create_projection(int srs)
     return new generic_reprojection_t(srs);
 }
 
-
-void reprojection::coords_to_tile(double *tilex, double *tiley,
-                                  double lon, double lat, int map_width)
+void reprojection::coords_to_tile(double *tilex, double *tiley, double lon,
+                                  double lat, uint32_t map_width)
 {
     target_to_tile(&lat, &lon);
 

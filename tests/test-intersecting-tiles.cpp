@@ -3,7 +3,8 @@
 #include <set>
 
 /**
- * This represents a y interval. The first element is the x index, the second is the minimum y and the third the maximum y value.
+ * This represents a y interval. The first element is the x index, the second
+ * is the minimum y and the third the maximum y value.
  */
 using tile_interval_t = std::array<uint32_t, 3>;
 

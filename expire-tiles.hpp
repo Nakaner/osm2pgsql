@@ -78,7 +78,8 @@ struct expire_tiles
     void from_bbox_lon_lat(double min_x, double min_y, double max_x, double max_y);
 
     /**
-     * Expire the tile intersecting this bounding box.
+     * Expire the tiles intersecting this bounding box. A buffer will be added to
+     * the bounding box.
      *
      * \param min_lon x coordinate of upper left corner in tile IDs
      * \param min_lat y coordinate of upper left corner in tile IDs
@@ -88,10 +89,35 @@ struct expire_tiles
     void from_bbox(double min_x, double min_y, double max_x, double max_y);
 
     /**
+     * Expire the tiles intersecting this bounding box. No buffer will be added.
+     */
+    void from_bbox_without_buffer(uint32_t min_x, uint32_t min_y,
+                                  uint32_t max_x, uint32_t max_y);
+
+    /**
+     * Expire a line segment including a buffer.
+     *
+     * Input coordinates are the coordinates in the projection of the database.
+     *
+     * This method checks if the line segment crosses the 180th meridian and splits
+     * it if necessary.
+     *
+     * \param lon_a longitude of start point
+     * \param lat_a latitude of start point
+     * \param lon_b longitude of end point
+     * \param lat_b latitude of end point
+     */
+    void from_line_lon_lat(double lon_a, double lat_a, double lon_b,
+                           double lat_b);
+
+    /**
      * Expire all tiles a line segment intersects with including a small buffer.
      *
      * Coordinates (x and y) are in tile IDs (but double).
      * The start point must have a smaller or equal x index than the end point.
+     *
+     * The difference between x2 and x1 must be smaller than half of the
+     * circumfence of the earth.
      *
      * \param x1 x index of the west end of the segment
      * \param y1 y index of the west end of the segment
@@ -101,19 +127,35 @@ struct expire_tiles
     void expire_line_segment(double x1, double y1, double x2, double y2);
 
     /**
+     * Expire all tiles a line from (x1,y1) to (x2,y2) intersects. A buffer is
+     * not included.
+     *
+     * Coordinates (x and y) are in tile IDs (but double).
+     * The start point must have a smaller than the x index than the end point.
+     *
+     * \param x1 x index of the west end of the segment
+     * \param y1 y index of the west end of the segment
+     * \param x2 x index of the east end of the segment
+     * \param y2 y index of the east end of the segment
+     */
+    void expire_line(double x1, double y1, double x2, double y2);
+
+    /**
      * Expire a line segment which runs straight from south to north or runs
-     * nearly in that direction.
+     * nearly in that direction. A buffer is not included.
      *
      * Coordinates (x and y) are in tile IDs (but double).
      * The start point must have a smaller y index than the end point.
      *
+     * If a input coordinate is smaller than 0, 0 will be used instead.
+     * If a input coordinate is larger than map_width, map_width will be used
+     * instead.
+     *
      * \param x x index of start and end point
      * \param y1 y index of the start point
      * \param y2 y index of the end point
-     * \param expire_parallels expire also the buffer of this line segment.
      */
-    void expire_vertical_line(double x, double y1, double y2,
-                              bool expire_parallels = true);
+    void expire_vertical_line(double x, double y1, double y2);
 
     void from_wkb(const char* wkb, osmid_t osm_id);
     int from_db(table_t* table, osmid_t osm_id);
@@ -208,6 +250,20 @@ private:
     static constexpr double TILE_EXPIRY_LEEWAY = 0.1;
 
     /**
+     * Check if a coordinate (x or y) of a tile at maxzoom zoom level is valid.
+     *
+     * This method checks if the coordinate is within the bounds for tile IDs
+     * at this zoom level and sets it to the bounds if it is too large.
+     *
+     * Because coord is unsigned, no check for coord < 0 is done.
+     *
+     * \coord coordinate to be checked
+     *
+     * \returns normalised coordinates
+     */
+    bool valid_tile_coord(uint32_t coord);
+
+    /**
      * Normalise the coordinate (x or y) of a tile at maxzoom zoom level.
      *
      * This method checks if the coordinate is within the bounds for tile IDs
@@ -215,7 +271,7 @@ private:
      *
      * \returns normalised coordinates
      */
-    uint32_t normalise_tile_coord(uint32_t coord);
+    double normalise_tile_coord(double coord);
 
     /**
      * Expire a single tile.
@@ -224,9 +280,6 @@ private:
      * \param y y index of the tile to be expired.
      */
     void expire_tile(uint32_t x, uint32_t y);
-    int normalise_tile_x_coord(int x);
-    void from_line_lon_lat(double lon_a, double lat_a, double lon_b,
-                           double lat_b);
 
     void from_wkb_point(ewkb::parser_t *wkb);
     void from_wkb_line(ewkb::parser_t *wkb);
@@ -248,7 +301,7 @@ private:
 
     double tile_width;
     double max_bbox;
-    int map_width;
+    uint32_t map_width;
     uint32_t maxzoom;
     std::shared_ptr<reprojection> projection;
 

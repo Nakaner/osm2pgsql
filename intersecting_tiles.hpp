@@ -43,8 +43,6 @@ class intersecting_tiles_t
     uint32_t max_tile_id;
     const double TILE_EXPIRY_LEEWAY;
 
-    static constexpr double PI = 3.14159265358979323846;
-
     /**
      * vector containing the minimum y values of all columns
      */
@@ -93,7 +91,8 @@ class intersecting_tiles_t
      * Examinate add a maxium or a minimum to the bounds vectors.
      *
      * This method examinates on its own if it is a maximum or a minimum.
-     * The direction of the segment (left to right or right to left) does not matter.
+     * The direction of the segment (left to right or right to left) does not
+     * matter.
      *
      * \param x x index of the tile
      * \param y1 y index of one end of the segment
@@ -138,7 +137,8 @@ public:
     void sort_bounds();
 
     /**
-     * Get the index in the x_stripes vector corresponding to this x coordinate (tile ID).
+     * Get the index in the x_stripes vector corresponding to this x coordinate
+     * (tile ID).
      */
     uint32_t get_x_index(uint32_t x);
 
@@ -159,13 +159,19 @@ public:
     /**
      * Get next pair of minimum and maximum.
      *
+     * Check column_has_intervals() before.
+     *
      * \returns a unique_ptr with minimum and maximum. An empty unique_ptr is
      * returned if either the no minimum or no maximum is found.
+     *
+     * \throws std::runtime_error if the end of the column has already been
+     * reached.
      */
     std::unique_ptr<std::pair<uint32_t, uint32_t>> get_next_pair();
 
     /**
-     * Check if there are intervals left in the current column which have not been
+     * Check if there are intervals left in the current column which have not
+     * been
      * queried yet.
      */
     bool column_has_intervals();
@@ -175,8 +181,8 @@ public:
      *
      * This increases current_x.
      *
-     * \returns False if there is no "next column" (end of bounds vector reached),
-     * true otherwise.
+     * \returns False if there is no "next column" (end of bounds vector
+     * reached), true otherwise.
      */
     bool move_to_next_column();
 

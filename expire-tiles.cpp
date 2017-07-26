@@ -99,39 +99,40 @@ xy_coord_t expire_tiles::quadkey_to_xy(uint64_t quadkey_coord, uint32_t zoom)
     return result;
 }
 
-uint32_t expire_tiles::normalise_tile_coord(uint32_t coord)
+bool expire_tiles::valid_tile_coord(uint32_t coord)
 {
-    if (coord < 0) {
-        return 0;
-    } else if (coord > static_cast<uint32_t>((2 << maxzoom) - 1)) {
+    // The check for coord < 0 is not necessary because coord is unsigned.
+    return coord <= map_width;
+}
+
+double expire_tiles::normalise_tile_coord(double coord)
+{
+    // The check for coord < 0 is not necessary because coord is unsigned.
+    if (coord > map_width) {
         return (2 << maxzoom) - 1;
+    } else if (coord < 0) {
+        return 0;
     }
     return coord;
 }
 
 void expire_tiles::expire_tile(uint32_t x, uint32_t y)
 {
+    if (!valid_tile_coord(x) || !valid_tile_coord(y)) {
+        return;
+    }
     // Only try to insert to tile into the set if the last inserted tile
     // is different from this tile.
     if (last_tile_x != x || last_tile_y != y) {
-        m_dirty_tiles.insert(xy_to_quadkey(normalise_tile_coord(x),
-                                           normalise_tile_coord(y), maxzoom));
+        m_dirty_tiles.insert(xy_to_quadkey(x, y, maxzoom));
         last_tile_x = x;
         last_tile_y = y;
     }
 }
 
-int expire_tiles::normalise_tile_x_coord(int x) {
-	x %= map_width;
-	if (x < 0) x = (map_width - x) + 1;
-	return x;
-}
-
 void expire_tiles::expire_line_segment(double x1, double y1, double x2,
                                        double y2)
 {
-    //TODO respect buffer by using two parallel lines
-    //TODO respect buffer at start and end
     assert(x1 <= x2);
     assert(x2 - x1 <= map_width / 2);
     if (x1 == x2 && y1 == y2) {
@@ -140,95 +141,130 @@ void expire_tiles::expire_line_segment(double x1, double y1, double x2,
     }
     // The following if block ensures that x2-x1 does not cause an
     // underflow which could cause a division by zero.
-    if (x2 - x1 < 1) {
-        // the extend of the bounding box of the line in x-direction is small
-        if ((static_cast<int>(x2) == static_cast<int>(x1)) ||
-            (x2 - x1 < 0.00000001)) {
-            /**
-             * Case 1: The linestring is parallel to a meridian or does not cross a tile border.
-             * Therefore we can treat it as a vertical linestring.
-             *
-             * Case 2: This linestring is almost parallel (very small error). We just treat it as a parallel of a meridian.
-             * The resulting error is negligible.
-             */
-            if (y2 < y1) {
-                // swap coordinates
-                double temp = y2;
-                y2 = y1;
-                y1 = temp;
-            }
-            expire_vertical_line(x1, y1, y2);
-            return;
+    if ((x2 - x1 < 1) && ((static_cast<int>(x2) == static_cast<int>(x1)) ||
+                          (x2 - x1 < 0.00000001))) {
+        /**
+         * Case 1: The linestring is parallel to a meridian or does not
+         * cross a tile border. Therefore we can treat it as a vertical
+         * linestring.
+         *
+         * Case 2: This linestring is almost parallel (very small error).
+         * We just treat it as a parallel of a meridian. The resulting
+         * error is negligible.
+         */
+        if (y2 < y1) {
+            // swap coordinates
+            double temp = y2;
+            y2 = y1;
+            y1 = temp;
         }
+        double x_buffer_west =
+            normalise_tile_coord(x1 - TILE_EXPIRY_LEEWAY);
+        expire_vertical_line(x_buffer_west, y1, y2);
+        // Expire parallels of this line with a distance of
+        // TILE_EXPIRY_LEEWAY. If it is not necessary because the parallels
+        // run through the same tiles, we don't call expire_vertical_line()
+        // again.
+        double x_buffer_east =
+            normalise_tile_coord(x1 + TILE_EXPIRY_LEEWAY);
+        if (static_cast<uint32_t>(x_buffer_west) !=
+            static_cast<uint32_t>(x_buffer_east)) {
+            expire_vertical_line(x_buffer_east, y1, y2);
+        }
+        return;
     }
+    // build the buffer
+    // length of the vector from (x1,y1) to (x2,y2)
+    double segment_length = sqrt((y2 - y1) * (y2 - y1) + (x2 - x1) * (x2 - x1));
+    double x_norm = (x2 - x1) / segment_length;
+    double y_norm = (y2 - y1) / segment_length;
+    double x_buffer = 0.1 * x_norm;
+    double y_buffer = 0.1 * y_norm;
+    // normal vector to the right: (-y,x), to the left: (y,-x)
+    // left parallel:
+    expire_line(x1 - x_buffer - y_buffer, y1 - y_buffer + x_buffer,
+                x2 + x_buffer - y_buffer, y2 + y_buffer + x_buffer);
+    // right parallel:
+    expire_line(x1 - x_buffer + y_buffer, y1 - y_buffer - x_buffer,
+                x2 + x_buffer + y_buffer, y2 + y_buffer - x_buffer);
+}
+
+void expire_tiles::expire_line(double x1, double y1, double x2, double y2)
+{
+    assert(x1 < x2);
     // y(x) = m * x + c with incline as m and y_intercept as c
     double incline = (y2 - y1) / (x2 - x1);
     double y_intercept = y2 - incline * x2;
 
+    // Check if it is a horizontal line and lies fully outside the domain of
+    // definition.
+    if (incline == 0 && (y_intercept < 0 || y_intercept > map_width)) {
+        return;
+    }
+
+    // If x2 is smaller or equal than 0, x1 will be also smaller and the whole
+    // line outside the domain of the Web Mercator projection.
+    if (x2 <= 0) {
+        return;
+    }
+    // Check if x1 is smaller than 0. Set x to 0 and y1 to the correct value
+    // if it is so.
+    if (x1 < 0) {
+        x1 = 0;
+        y1 = y_intercept;
+    }
+    // It is not a problem if any of x1, x2, y1 and y2 is larger than map_width
+    // because expire_tile() will just return without doing anything if we want
+    // to expire a tile with x > map_width. It is only a problem if one of them
+    // is smaller than 0 because expire_tile() accepts unsigned integers.
+    if (y1 < 0) {
+        y1 = 0;
+        // 0 = incline * x + y_intercept
+        x1 = -y_intercept / incline;
+    }
+    if (y2 < 0) {
+        y2 = 0;
+        x2 = -y_intercept / incline;
+    }
+
     // mark start tile as expired
-    from_bbox(x1, y1, x1, y1);
+    expire_tile(static_cast<uint32_t>(x1), static_cast<uint32_t>(y1));
     // expire all tiles the line enters by crossing their western edge
-    for (int x = static_cast<int>(x1 + 1); x <= static_cast<int>(x2) - 1; x++) {
+    for (uint32_t x = static_cast<uint32_t>(x1 + 1);
+         x <= static_cast<uint32_t>(x2); ++x) {
         double y = incline * x + y_intercept;
-        expire_tile(x, static_cast<int>(y));
-        // If y is only 0.1 tiles away from a tile edged, we have to expire the neighboring
-        // tile, too. Calling from_bbox(...) would call expire_tile(...) more often than
-        // necessary. (We don't have to expire the tile on the left side of this edge
-        // again.
-        if (static_cast<int>(y - TILE_EXPIRY_LEEWAY) != static_cast<int>(y)) {
-            expire_tile(x, static_cast<int>(y - TILE_EXPIRY_LEEWAY));
-        } else if (static_cast<int>(y + TILE_EXPIRY_LEEWAY) !=
-                   static_cast<int>(y) + 1) {
-            expire_tile(x, static_cast<int>(y + TILE_EXPIRY_LEEWAY));
-        }
+        expire_tile(x, static_cast<uint32_t>(y));
     }
-    // the same for all tiles which are entered by crossing their southern edge
-    expire_tile(static_cast<int>(x1), static_cast<int>(y1));
-    for (int y = static_cast<int>(y1 + 1); y <= static_cast<int>(y2) - 1; y++) {
+    // the same for all tiles which are entered by crossing their northern edge
+    double min_y = std::min(y1, y2);
+    double max_y = std::max(y1, y2);
+    for (uint32_t y = static_cast<uint32_t>(min_y + 1);
+         y <= static_cast<uint32_t>(max_y); ++y) {
         double x = (y - y_intercept) / incline;
-        expire_tile(static_cast<int>(x), y);
-        //TODO explain following ifs
-        if (static_cast<int>(x - TILE_EXPIRY_LEEWAY) != static_cast<int>(x)) {
-            expire_tile(static_cast<int>(x - TILE_EXPIRY_LEEWAY), y);
-        } else if (static_cast<int>(x + TILE_EXPIRY_LEEWAY) !=
-                   static_cast<int>(x) + 1) {
-            expire_tile(static_cast<int>(x + TILE_EXPIRY_LEEWAY), y);
+        if (y2 > y1) {
+            // line going to the south on its way from (x1,y1) to (x2,y2)
+            expire_tile(static_cast<uint32_t>(x), y);
+        } else {
+            expire_tile(static_cast<uint32_t>(x), y - 1);
         }
     }
-    // expire end node
-    from_bbox(x2, y2, x2, y2);
 }
 
-void expire_tiles::expire_vertical_line(double x, double y1, double y2,
-                                        bool expire_parallels /* = true*/)
+void expire_tiles::expire_vertical_line(double x, double y1, double y2)
 {
-    assert(y1 <= y2); // line in correct order and not collapsed
+    assert(y1 < y2); // line in correct order and not collapsed
     // mark the tile of the southern end and its buffer as expired
-    from_bbox(static_cast<int>(x), static_cast<int>(y1), static_cast<int>(x),
-              static_cast<int>(y1));
-    // mark all tiles above it as expired until we reach the northern end of the line
-    for (int y = static_cast<int>(y1 + 1); y < static_cast<int>(y2); y++) {
-        expire_tile(static_cast<int>(x), y);
+    from_bbox(x, y1, x, y1);
+    // mark all tiles above it as expired until we reach the northern end of
+    // the line
+    for (uint32_t y = static_cast<uint32_t>(y1 + 1);
+         y < static_cast<uint32_t>(y2); y++) {
+        expire_tile(static_cast<uint32_t>(x), y);
     }
     // mark the tile at the northern end and its buffer as expired
-    from_bbox(static_cast<int>(x), static_cast<int>(y2), static_cast<int>(x),
-              static_cast<int>(y2));
-    // expire parallels of this line with a distance of TILE_EXPIRY_LEEWAY
-    // If it is not necessary because the parallels run through the same tiles,
-    // we don't call this method again.
-    if (expire_parallels &&
-        static_cast<int>(x - TILE_EXPIRY_LEEWAY) == static_cast<int>(x)) {
-        expire_vertical_line(x - TILE_EXPIRY_LEEWAY, y1, y2, false);
-    } else if (expire_parallels &&
-               static_cast<int>(x + TILE_EXPIRY_LEEWAY) ==
-                   static_cast<int>(x) + 1) {
-        expire_vertical_line(x + TILE_EXPIRY_LEEWAY, y1, y2, false);
-    }
+    from_bbox(x, y2, x, y2);
 }
 
-/*
- * Expire tiles that a line crosses
- */
 void expire_tiles::from_line_lon_lat(double lon_a, double lat_a, double lon_b,
                                      double lat_b)
 {
@@ -244,17 +280,19 @@ void expire_tiles::from_line_lon_lat(double lon_a, double lat_a, double lon_b,
         std::swap(tile_y_a, tile_y_b);
     }
     if (tile_x_b - tile_x_a > map_width / 2) {
-        // line crosses 180th meridian → split the line at its intersection with this meridian
-        // x-coordinate of intersection point: map_width/2
+        // line crosses 180th meridian → split the line at its intersection
+        // with this meridian
         double y_split; // y-coordinate of intersection point
         if (tile_x_b == map_width && tile_x_a == 0) {
-            // The line is part of the 180th meridian. We have to treat this in a special way, otherwise there will
+            // The line is part of the 180th meridian. We have to treat this in
+            // a special way, otherwise there will
             // be a division by 0 in the following code.
             expire_line_segment(0, tile_y_a, 0, tile_y_b);
             return;
         }
         // This line runs from western to eastern hemisphere over the 180th meridian
-        // use intercept theorem to get the intersection point of the line and the 180th meridian
+        // use intercept theorem to get the intersection point of the line and
+        // the 180th meridian
         // x-distance between left point and 180th meridian
         double x_distance = map_width + tile_x_a - tile_x_b;
         // apply intercept theorem: (y2-y1)/(y_split-y1) = (x2-x1)/(x_split-x1)
@@ -275,7 +313,8 @@ void expire_tiles::from_point(double lon, double lat)
 }
 
 void expire_tiles::from_bbox_lon_lat(double min_x, double min_y, double max_x,
-                                     double max_y) {
+                                     double max_y)
+{
     double x_min;
     double y_min;
     double x_max;
@@ -292,8 +331,16 @@ void expire_tiles::from_bbox(double min_x, double min_y, double max_x,
     min_y -= TILE_EXPIRY_LEEWAY;
     max_x += TILE_EXPIRY_LEEWAY;
     max_y += TILE_EXPIRY_LEEWAY;
-    for (int iterator_x = min_x; iterator_x <= max_x; iterator_x++) {
-        for (int iterator_y = min_y; iterator_y <= max_y; iterator_y++) {
+    from_bbox_without_buffer(
+        static_cast<uint32_t>(min_x), static_cast<uint32_t>(min_y),
+        static_cast<uint32_t>(max_x), static_cast<uint32_t>(max_y));
+}
+
+void expire_tiles::from_bbox_without_buffer(uint32_t min_x, uint32_t min_y,
+                                            uint32_t max_x, uint32_t max_y)
+{
+    for (uint32_t iterator_x = min_x; iterator_x <= max_x; ++iterator_x) {
+        for (uint32_t iterator_y = min_y; iterator_y <= max_y; ++iterator_y) {
             expire_tile(iterator_x, iterator_y);
         }
     }
@@ -418,8 +465,8 @@ void expire_tiles::from_wkb_polygon(ewkb::parser_t *wkb, osmid_t osm_id)
     projection->coords_to_tile(&min_x, &min_y, min.x, max.y, map_width);
     projection->coords_to_tile(&max_x, &max_y, max.x, min.y, map_width);
 
-    // If the polygon does not the border between two tile columns in maxzoom,
-    // it can be simply expired by expiring its bounding box.
+    // If the polygon does not cross the border between two tile columns in
+    // maxzoom, it can be simply expired by expiring its bounding box.
     if (static_cast<uint32_t>(min_x) == static_cast<uint32_t>(max_x)) {
         from_bbox(min_x, min_y, max_x, max_y);
     }
@@ -458,6 +505,7 @@ void expire_tiles::from_wkb_polygon(ewkb::parser_t *wkb, osmid_t osm_id)
         }
     }
     // mark tiles as expired
+    tiles.sort_bounds();
     do {
         while (tiles.column_has_intervals()) {
             std::unique_ptr<std::pair<uint32_t, uint32_t>> interval =
@@ -467,8 +515,8 @@ void expire_tiles::from_wkb_polygon(ewkb::parser_t *wkb, osmid_t osm_id)
                 continue;
             }
             //TODO handling last column
-            from_bbox(tiles.get_current_x(), interval->first,
-                      tiles.get_current_x(), interval->second);
+            from_bbox_without_buffer(tiles.get_current_x(), interval->first,
+                                     tiles.get_current_x(), interval->second);
         }
     } while (tiles.move_to_next_column());
 }

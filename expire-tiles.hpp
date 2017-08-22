@@ -299,9 +299,9 @@ private:
     void evaluate_segment(intersecting_tiles_t &tiles, double x1, double y1,
                           double x2, double y2);
 
-    double tile_width;
+    double tile_width = 0;
     double max_bbox;
-    uint32_t map_width;
+    uint32_t map_width = 0;
     uint32_t maxzoom;
     std::shared_ptr<reprojection> projection;
 

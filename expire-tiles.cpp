@@ -446,9 +446,13 @@ void expire_tiles::from_wkb_polygon(ewkb::parser_t *wkb, osmid_t osm_id)
        (2) most software does not handle them correctly,
        (3) it is not unsafe if they are not expired.
        We had to split them at the antimeridian if we want to handle them
-       properly. */
-    if (max.x - min.x > max_bbox || max.y - min.y > max_bbox) {
-        // expire all rings as if they were only lines
+       properly.
+
+       In addition, we treat all polygons wider or taller than the maximum
+       bounding box as lines to prevent that changes on a boundary relation
+       expire a whole country. */
+    if (max.x - min.x > max_bbox || max.y - min.y > max_bbox
+        || max.x - min.x > HALF_EARTH_CIRCUMFERENCE) {
         for (unsigned ring = 0; ring < num_rings; ++ring) {
             wkb->rewind(start);
             from_wkb_line(wkb);
